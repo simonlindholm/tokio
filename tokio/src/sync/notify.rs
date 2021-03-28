@@ -6,7 +6,7 @@
 #![cfg_attr(not(feature = "sync"), allow(unreachable_pub, dead_code))]
 
 use crate::loom::sync::atomic::AtomicUsize;
-use crate::loom::sync::Mutex;
+use crate::loom::sync::{Mutex, MutexGuard};
 use crate::util::linked_list::{self, LinkedList};
 
 use std::cell::UnsafeCell;
@@ -119,10 +119,23 @@ pub struct Notify {
 
 #[derive(Debug, Clone, Copy)]
 enum NotificationType {
-    // Notification triggered by calling `notify_waiters`
+    // Not yet notified
+    NotNotified,
+    // Notified by calling `notify_waiters` but not yet woken
+    AllWaitersUnwoken,
+    // Notified by calling `notify_waiters`
     AllWaiters,
-    // Notification triggered by calling `notify_one`
+    // Notified by calling `notify_one`
     OneWaiter,
+}
+
+impl NotificationType {
+    fn notified_and_woken(&self) -> bool {
+        match self {
+            NotificationType::AllWaiters | NotificationType::OneWaiter => true,
+            NotificationType::NotNotified | NotificationType::AllWaitersUnwoken => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -134,7 +147,7 @@ struct Waiter {
     waker: Option<Waker>,
 
     /// `true` if the notification has been assigned to this waiter.
-    notified: Option<NotificationType>,
+    notified: NotificationType,
 
     /// Should not be `Unpin`.
     _p: PhantomPinned,
@@ -272,7 +285,7 @@ impl Notify {
             waiter: UnsafeCell::new(Waiter {
                 pointers: linked_list::Pointers::new(),
                 waker: None,
-                notified: None,
+                notified: NotificationType::NotNotified,
                 _p: PhantomPinned,
             }),
         }
@@ -318,10 +331,11 @@ impl Notify {
         // Load the current state
         let mut curr = self.state.load(SeqCst);
 
-        // If the state is `EMPTY`, transition to `NOTIFIED` and return.
+        // Fast path: if the state is `EMPTY`, transition to `NOTIFIED` and
+        // return.
         while let EMPTY | NOTIFIED = get_state(curr) {
-            // The compare-exchange from `NOTIFIED` -> `NOTIFIED` is intended. A
-            // happens-before synchronization must happen between this atomic
+            // The compare-exchange from `NOTIFIED` -> `NOTIFIED` is intended.
+            // A happens-before synchronization must happen between this atomic
             // operation and a task calling `notified().await`.
             let new = set_state(curr, NOTIFIED);
             let res = self.state.compare_exchange(curr, new, SeqCst, SeqCst);
@@ -335,17 +349,15 @@ impl Notify {
             }
         }
 
-        // There are waiters, the lock must be acquired to notify.
-        let mut waiters = self.waiters.lock();
+        // Slow path; there are probably waiters we need to notify. Start by
+        // taking the lock.
+        let waiters = self.waiters.lock();
 
         // The state must be reloaded while the lock is held. The state may only
-        // transition out of WAITING while the lock is held.
+        // transition into or out of WAITING while the lock is held.
         curr = self.state.load(SeqCst);
 
-        if let Some(waker) = notify_locked(&mut waiters, &self.state, curr) {
-            drop(waiters);
-            waker.wake();
-        }
+        notify_locked(&self, waiters, curr);
     }
 
     /// Notifies all waiting tasks
@@ -405,51 +417,94 @@ impl Notify {
         // At this point, it is guaranteed that the state will not
         // concurrently change, as holding the lock is required to
         // transition **out** of `WAITING`.
-        'outer: loop {
-            while curr_waker < NUM_WAKERS {
-                match waiters.pop_back() {
-                    Some(mut waiter) => {
-                        // Safety: `waiters` lock is still held.
-                        let waiter = unsafe { waiter.as_mut() };
+        while curr_waker < NUM_WAKERS {
+            match waiters.pop_back() {
+                Some(mut waiter) => {
+                    // Safety: `waiters` lock is still held.
+                    let waiter = unsafe { waiter.as_mut() };
 
-                        assert!(waiter.notified.is_none());
+                    assert!(!waiter.notified.notified_and_woken());
 
-                        waiter.notified = Some(NotificationType::AllWaiters);
+                    waiter.notified = NotificationType::AllWaiters;
 
-                        if let Some(waker) = waiter.waker.take() {
-                            wakers[curr_waker] = Some(waker);
-                            curr_waker += 1;
-                        }
-                    }
-                    None => {
-                        break 'outer;
-                    }
+                    wakers[curr_waker] = waiter.waker.take();
+                    curr_waker += 1;
+                }
+                None => {
+                    break;
                 }
             }
-
-            drop(waiters);
-
-            for waker in wakers.iter_mut().take(curr_waker) {
-                waker.take().unwrap().wake();
-            }
-
-            curr_waker = 0;
-
-            // Acquire the lock again.
-            waiters = self.waiters.lock();
         }
 
-        // All waiters will be notified, the state must be transitioned to
-        // `EMPTY`. As transitioning **from** `WAITING` requires the lock to be
-        // held, a `store` is sufficient.
-        let new = set_state(inc_num_notify_waiters_calls(curr), EMPTY);
-        self.state.store(new, SeqCst);
+        for waiter in waiters.iter_mut() {
+            assert!(!waiter.notified.notified_and_woken());
+
+            if let NotificationType::AllWaitersUnwoken = waiter.notified {
+                // The remaining suffix of the list has already been marked
+                // as AllWaitersUnwoken.
+                break;
+            }
+
+            waiter.notified = NotificationType::AllWaitersUnwoken;
+        }
+
+        let mut has_remaining_waiters = !waiters.is_empty();
+
+        let mut new_state = inc_num_notify_waiters_calls(curr);
+        if !has_remaining_waiters {
+            new_state = set_state(new_state, EMPTY);
+        }
+
+        // As transitioning **from** `WAITING` requires the lock to be held, a
+        // `store` is sufficient.
+        self.state.store(new_state, SeqCst);
 
         // Release the lock before notifying
         drop(waiters);
 
         for waker in wakers.iter_mut().take(curr_waker) {
             waker.take().unwrap().wake();
+        }
+
+        while has_remaining_waiters {
+            let mut waiters = self.waiters.lock();
+
+            let curr = self.state.load(SeqCst);
+
+            if get_state(curr) != WAITING {
+                break;
+            }
+
+            curr_waker = 0;
+            while curr_waker < NUM_WAKERS {
+                match waiters.last() {
+                    Some(waiter) if matches!(waiter.notified, NotificationType::AllWaitersUnwoken) => {
+                        let mut waiter = waiters.pop_back().unwrap();
+                        // Safety: `waiters` lock is still held.
+                        let waiter = unsafe { waiter.as_mut() };
+
+                        waiter.notified = NotificationType::AllWaiters;
+
+                        wakers[curr_waker] = waiter.waker.take();
+                        curr_waker += 1;
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
+
+            has_remaining_waiters = !waiters.is_empty();
+            if !has_remaining_waiters {
+                self.state.store(set_state(curr, EMPTY), SeqCst);
+            }
+
+            // Release the lock before notifying
+            drop(waiters);
+
+            for waker in wakers.iter_mut().take(curr_waker) {
+                waker.take().unwrap().wake();
+            }
         }
     }
 }
@@ -460,50 +515,79 @@ impl Default for Notify {
     }
 }
 
-fn notify_locked(waiters: &mut WaitList, state: &AtomicUsize, curr: usize) -> Option<Waker> {
+fn notify_locked<'a>(notify: &'a Notify, mut waiters: MutexGuard<'a, WaitList>, curr: usize) {
+    const NUM_WAKERS: usize = 32;
+
     loop {
+        let mut wakers: [Option<Waker>; NUM_WAKERS] = Default::default();
+        let mut curr_waker = 0;
+        let mut found_unnotified = false;
+
         match get_state(curr) {
             EMPTY | NOTIFIED => {
-                let res = state.compare_exchange(curr, set_state(curr, NOTIFIED), SeqCst, SeqCst);
-
-                match res {
-                    Ok(_) => return None,
-                    Err(actual) => {
-                        let actual_state = get_state(actual);
-                        assert!(actual_state == EMPTY || actual_state == NOTIFIED);
-                        state.store(set_state(actual, NOTIFIED), SeqCst);
-                        return None;
-                    }
+                // The compare-exchange from `NOTIFIED` -> `NOTIFIED` is intended.
+                // A happens-before synchronization must happen between this atomic
+                // operation and a task calling `notified().await`.
+                if let Err(actual) = notify.state.compare_exchange(curr, set_state(curr, NOTIFIED), SeqCst, SeqCst) {
+                    let actual_state = get_state(actual);
+                    assert!(actual_state == EMPTY || actual_state == NOTIFIED);
+                    notify.state.store(set_state(actual, NOTIFIED), SeqCst);
                 }
+                return;
             }
             WAITING => {
+                let waiters = &mut waiters;
+
                 // At this point, it is guaranteed that the state will not
                 // concurrently change as holding the lock is required to
                 // transition **out** of `WAITING`.
-                //
-                // Get a pending waiter
-                let mut waiter = waiters.pop_back().unwrap();
+                while curr_waker < NUM_WAKERS && !found_unnotified {
+                    match waiters.pop_back() {
+                        Some(mut waiter) => {
+                            // Safety: `waiters` lock is still held.
+                            let waiter = unsafe { waiter.as_mut() };
 
-                // Safety: `waiters` lock is still held.
-                let waiter = unsafe { waiter.as_mut() };
+                            assert!(!waiter.notified.notified_and_woken());
 
-                assert!(waiter.notified.is_none());
+                            if let NotificationType::AllWaitersUnwoken = waiter.notified {
+                                waiter.notified = NotificationType::AllWaiters;
+                            } else {
+                                waiter.notified = NotificationType::OneWaiter;
+                                found_unnotified = true;
+                            }
 
-                waiter.notified = Some(NotificationType::OneWaiter);
-                let waker = waiter.waker.take();
-
-                if waiters.is_empty() {
-                    // As this the **final** waiter in the list, the state
-                    // must be transitioned to `EMPTY`. As transitioning
-                    // **from** `WAITING` requires the lock to be held, a
-                    // `store` is sufficient.
-                    state.store(set_state(curr, EMPTY), SeqCst);
+                            wakers[curr_waker] = waiter.waker.take();
+                            curr_waker += 1;
+                        }
+                        None => break
+                    }
                 }
 
-                return waker;
+                if waiters.is_empty() {
+                    let new_state = if found_unnotified {
+                        EMPTY
+                    } else {
+                        found_unnotified = true;
+                        NOTIFIED
+                    };
+                    notify.state.store(set_state(curr, new_state), SeqCst);
+                }
             }
             _ => unreachable!(),
+        };
+
+        // Release the lock before notifying
+        drop(waiters);
+
+        for waker in wakers.iter_mut().take(curr_waker) {
+            waker.take().unwrap().wake();
         }
+
+        if found_unnotified {
+            return;
+        }
+
+        waiters = notify.waiters.lock();
     }
 }
 
@@ -539,14 +623,12 @@ impl Future for Notified<'_> {
                     let curr = notify.state.load(SeqCst);
 
                     // Optimistically try acquiring a pending notification
-                    let res = notify.state.compare_exchange(
+                    if notify.state.compare_exchange(
                         set_state(curr, NOTIFIED),
                         set_state(curr, EMPTY),
                         SeqCst,
                         SeqCst,
-                    );
-
-                    if res.is_ok() {
+                    ).is_ok() {
                         // Acquired the notification
                         *state = Done;
                         return Poll::Ready(());
@@ -636,14 +718,7 @@ impl Future for Notified<'_> {
                     // Safety: called while locked
                     let w = unsafe { &mut *waiter.get() };
 
-                    if w.notified.is_some() {
-                        // Our waker has been notified. Reset the fields and
-                        // remove it from the list.
-                        w.waker = None;
-                        w.notified = None;
-
-                        *state = Done;
-                    } else {
+                    if let NotificationType::NotNotified = w.notified {
                         // Update the waker, if necessary.
                         if !w.waker.as_ref().unwrap().will_wake(cx.waker()) {
                             w.waker = Some(cx.waker().clone());
@@ -651,6 +726,13 @@ impl Future for Notified<'_> {
 
                         return Poll::Pending;
                     }
+
+                    // Our waker has been notified. Reset the fields and remove
+                    // it from the list.
+                    w.waker = None;
+                    w.notified = NotificationType::NotNotified;
+
+                    *state = Done;
 
                     // Explicit drop of the lock to indicate the scope that the
                     // lock is held. Because holding the lock is required to
@@ -718,11 +800,8 @@ impl Drop for Notified<'_> {
             //
             // Safety: with the entry removed from the linked list, there can be
             // no concurrent access to the entry
-            if let Some(NotificationType::OneWaiter) = unsafe { (*waiter.get()).notified } {
-                if let Some(waker) = notify_locked(&mut waiters, &notify.state, notify_state) {
-                    drop(waiters);
-                    waker.wake();
-                }
+            if let NotificationType::OneWaiter = unsafe { (*waiter.get()).notified } {
+                notify_locked(&notify, waiters, notify_state);
             }
         }
     }

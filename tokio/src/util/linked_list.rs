@@ -232,6 +232,37 @@ cfg_rt_multi_thread! {
     }
 }
 
+// ===== impl IterMut =====
+
+cfg_sync! {
+    pub(crate) struct IterMut<'a, T: Link> {
+        curr: Option<NonNull<T::Target>>,
+        _p: core::marker::PhantomData<&'a mut T>,
+    }
+
+    impl<L: Link> LinkedList<L, L::Target> {
+        pub(crate) fn iter_mut(&mut self) -> IterMut<'_, L> {
+            IterMut {
+                curr: self.head,
+                _p: core::marker::PhantomData,
+            }
+        }
+    }
+
+    impl<'a, T: Link> Iterator for IterMut<'a, T> {
+        type Item = &'a mut T::Target;
+
+        fn next(&mut self) -> Option<&'a mut T::Target> {
+            let curr = self.curr?;
+            // safety: the pointer references data contained by the list
+            self.curr = unsafe { T::pointers(curr).as_ref() }.next;
+
+            // safety: the value is still owned by the linked list.
+            Some(unsafe { &mut *curr.as_ptr() })
+        }
+    }
+}
+
 // ===== impl DrainFilter =====
 
 cfg_io_readiness! {
