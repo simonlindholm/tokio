@@ -112,7 +112,7 @@ pub struct Notify {
     // This uses 2 bits to store one of `EMPTY`,
     // `WAITING` or `NOTIFIED`. The rest of the bits
     // are used to store the number of times `notify_waiters`
-    // was called.
+    // was called (the "generation").
     state: AtomicUsize,
     waiters: Mutex<WaitList>,
 }
@@ -129,6 +129,9 @@ enum NotificationType {
 struct Waiter {
     /// Intrusive linked-list pointers
     pointers: linked_list::Pointers<Waiter>,
+
+    /// `notify_waiters` generation at the time the Notified was created.
+    initial_generation: usize,
 
     /// Waiting task's waker
     waker: Option<Waker>,
@@ -158,14 +161,13 @@ unsafe impl<'a> Sync for Notified<'a> {}
 
 #[derive(Debug)]
 enum State {
-    Init(usize),
+    Init,
     Waiting,
     Done,
 }
 
-const NOTIFY_WAITERS_SHIFT: usize = 2;
-const STATE_MASK: usize = (1 << NOTIFY_WAITERS_SHIFT) - 1;
-const NOTIFY_WAITERS_CALLS_MASK: usize = !STATE_MASK;
+const GENERATION_SHIFT: u32 = 2;
+const STATE_MASK: usize = (1 << GENERATION_SHIFT) - 1;
 
 /// Initial "idle" state
 const EMPTY: usize = 0;
@@ -177,19 +179,23 @@ const WAITING: usize = 1;
 const NOTIFIED: usize = 2;
 
 fn set_state(data: usize, state: usize) -> usize {
-    (data & NOTIFY_WAITERS_CALLS_MASK) | (state & STATE_MASK)
+    (data & !STATE_MASK) | (state & STATE_MASK)
 }
 
 fn get_state(data: usize) -> usize {
     data & STATE_MASK
 }
 
-fn get_num_notify_waiters_calls(data: usize) -> usize {
-    (data & NOTIFY_WAITERS_CALLS_MASK) >> NOTIFY_WAITERS_SHIFT
+fn get_generation(data: usize) -> usize {
+    data >> GENERATION_SHIFT
 }
 
-fn inc_num_notify_waiters_calls(data: usize) -> usize {
-    data + (1 << NOTIFY_WAITERS_SHIFT)
+fn inc_generation(data: usize) -> usize {
+    data.wrapping_add(1 << GENERATION_SHIFT)
+}
+
+fn earlier_generation(a: usize, b: usize) -> bool {
+    (a as isize - b as isize).wrapping_shl(GENERATION_SHIFT) < 0
 }
 
 impl Notify {
@@ -268,9 +274,10 @@ impl Notify {
         let state = self.state.load(SeqCst);
         Notified {
             notify: self,
-            state: State::Init(state >> NOTIFY_WAITERS_SHIFT),
+            state: State::Init,
             waiter: UnsafeCell::new(Waiter {
                 pointers: linked_list::Pointers::new(),
+                initial_generation: get_generation(state),
                 waker: None,
                 notified: None,
                 _p: PhantomPinned,
@@ -391,28 +398,87 @@ impl Notify {
 
         // The state must be reloaded while the lock is held. The state may only
         // transition out of WAITING while the lock is held.
-        let curr = self.state.load(SeqCst);
+        let mut curr = self.state.load(SeqCst);
 
         if let EMPTY | NOTIFIED = get_state(curr) {
             // There are no waiting tasks. In this case, no synchronization is
             // established between `notify` and `notified().await`.
             // All we need to do is increment the number of times this
             // method was called.
-            self.state.store(inc_num_notify_waiters_calls(curr), SeqCst);
+            self.state.store(inc_generation(curr), SeqCst);
             return;
         }
 
         // At this point, it is guaranteed that the state will not
         // concurrently change, as holding the lock is required to
         // transition **out** of `WAITING`.
-        'outer: loop {
+        while curr_waker < NUM_WAKERS {
+            match waiters.pop_back() {
+                Some(mut waiter) => {
+                    // Safety: `waiters` lock is still held.
+                    let waiter = unsafe { waiter.as_mut() };
+
+                    assert!(waiter.notified.is_none());
+
+                    waiter.notified = Some(NotificationType::AllWaiters);
+
+                    if let Some(waker) = waiter.waker.take() {
+                        wakers[curr_waker] = Some(waker);
+                        curr_waker += 1;
+                    }
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        let mut more_waiters = false;
+
+        // All waiters will be notified, the state must be transitioned to
+        // `EMPTY`. As transitioning **from** `WAITING` requires the lock to be
+        // held, a `store` is sufficient.
+        curr = inc_generation(curr);
+        if waiters.is_empty() {
+            curr = set_state(curr, EMPTY);
+            more_waiters = true;
+        }
+        self.state.store(curr, SeqCst);
+
+        let generation = get_generation(curr);
+
+        // Release the lock before notifying
+        drop(waiters);
+
+        for waker in wakers.iter_mut().take(curr_waker) {
+            waker.take().unwrap().wake();
+        }
+
+        while more_waiters {
+            curr_waker = 0;
+
+            // Acquire the lock again.
+            waiters = self.waiters.lock();
+
+            curr = self.state.load(SeqCst);
+            if get_state(curr) != WAITING {
+                break;
+            }
+
             while curr_waker < NUM_WAKERS {
-                match waiters.pop_back() {
-                    Some(mut waiter) => {
+                match waiters.last() {
+                    Some(waiter) => {
+                        assert!(waiter.notified.is_none());
+
+                        if !earlier_generation(waiter.initial_generation, generation) {
+                            break;
+                        }
+
+                        // Extract the waiter from the list for real.
+                        let mut waiter = waiters.pop_back().unwrap();
+
                         // Safety: `waiters` lock is still held.
                         let waiter = unsafe { waiter.as_mut() };
-
-                        assert!(waiter.notified.is_none());
 
                         waiter.notified = Some(NotificationType::AllWaiters);
 
@@ -422,9 +488,14 @@ impl Notify {
                         }
                     }
                     None => {
-                        break 'outer;
+                        break;
                     }
                 }
+            }
+
+            if waiters.is_empty() {
+                self.state.store(set_state(curr, EMPTY), SeqCst);
+                more_waiters = false;
             }
 
             drop(waiters);
@@ -432,24 +503,6 @@ impl Notify {
             for waker in wakers.iter_mut().take(curr_waker) {
                 waker.take().unwrap().wake();
             }
-
-            curr_waker = 0;
-
-            // Acquire the lock again.
-            waiters = self.waiters.lock();
-        }
-
-        // All waiters will be notified, the state must be transitioned to
-        // `EMPTY`. As transitioning **from** `WAITING` requires the lock to be
-        // held, a `store` is sufficient.
-        let new = set_state(inc_num_notify_waiters_calls(curr), EMPTY);
-        self.state.store(new, SeqCst);
-
-        // Release the lock before notifying
-        drop(waiters);
-
-        for waker in wakers.iter_mut().take(curr_waker) {
-            waker.take().unwrap().wake();
         }
     }
 }
@@ -535,7 +588,7 @@ impl Future for Notified<'_> {
 
         loop {
             match *state {
-                Init(initial_notify_waiters_calls) => {
+                Init => {
                     let curr = notify.state.load(SeqCst);
 
                     // Optimistically try acquiring a pending notification
@@ -552,6 +605,17 @@ impl Future for Notified<'_> {
                         return Poll::Ready(());
                     }
 
+                    // Safety: since state is Init, the waiter is not in any
+                    // list yet, so we have exclusive access to it.
+                    let initial_generation = unsafe { (*waiter.get()).initial_generation };
+
+                    // If notify_waiters has been called after the future
+                    // was created, then we are done
+                    if get_generation(curr) != initial_generation {
+                        *state = Done;
+                        return Poll::Ready(());
+                    }
+
                     // Acquire the lock and attempt to transition to the waiting
                     // state.
                     let mut waiters = notify.waiters.lock();
@@ -559,9 +623,8 @@ impl Future for Notified<'_> {
                     // Reload the state with the lock held
                     let mut curr = notify.state.load(SeqCst);
 
-                    // if notify_waiters has been called after the future
-                    // was created, then we are done
-                    if get_num_notify_waiters_calls(curr) != initial_notify_waiters_calls {
+                    // Recheck number of notify_waiters calls
+                    if get_generation(curr) != initial_generation {
                         *state = Done;
                         return Poll::Ready(());
                     }
@@ -611,17 +674,18 @@ impl Future for Notified<'_> {
                         }
                     }
 
-                    // Safety: called while locked.
-                    unsafe {
-                        (*waiter.get()).waker = Some(cx.waker().clone());
-                    }
+                    // Safety: called while locked
+                    let w = unsafe { &mut *waiter.get() };
+
+                    w.waker = Some(cx.waker().clone());
 
                     // Insert the waiter into the linked list
-                    //
-                    // safety: pointers from `UnsafeCell` are never null.
-                    waiters.push_front(unsafe { NonNull::new_unchecked(waiter.get()) });
+                    waiters.push_front(w.into());
 
                     *state = Waiting;
+
+                    // Explicitly mark the end of the lock scope.
+                    drop(waiters);
 
                     return Poll::Pending;
                 }
